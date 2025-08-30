@@ -1,6 +1,7 @@
 import AppLogo from '@/components/app-logo';
 import AppearanceToggleDropdown from '@/components/appearance-dropdown';
 import { Button } from '@/components/ui/button';
+import LiveChatWidget from '@/components/live-chat-widget';
 import {
     DropdownMenu,
     DropdownMenuContent,
@@ -420,6 +421,9 @@ const GuestLayout: React.FC<GuestLayoutProps> = ({ children }) => {
                     </div>
                 </div>
             </footer>
+
+            {/* Live Chat Widget - Only show when user is authenticated */}
+            {isAuthenticated && <LiveChatWidget />}
         </div>
     );
 };
