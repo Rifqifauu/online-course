@@ -466,7 +466,7 @@ export default function Welcome() {
 
                         {/* Weather Widget in Hero */}
                         <ScrollAnimation variants={slideInRight} className="lg:col-span-1">
-                            <WeatherCard defaultLocation={institution?.address || 'Pare, Kediri'} />
+                            <WeatherCard defaultLocation='Pare, Kediri' />
                         </ScrollAnimation>
                     </div>
                 </div>
