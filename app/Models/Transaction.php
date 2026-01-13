@@ -16,6 +16,8 @@ class Transaction extends Model
         'transactionable_id',
         'transactionable_type',
         'midtrans_order_id',
+        'flip_bill_id',
+        'payment_gateway',
         'amount',
         'payment_method',
         'status',
@@ -81,5 +83,41 @@ class Transaction extends Model
         return \App\Models\Enrollment::where('user_id', $this->user_id)
             ->where('course_id', $this->transactionable_id)
             ->exists();
+    }
+
+    /**
+     * Get the transaction order ID (supports both Midtrans and Flip)
+     */
+    public function getOrderId(): ?string
+    {
+        return $this->midtrans_order_id ?? $this->flip_bill_id;
+    }
+
+    /**
+     * Check if this is a Flip transaction
+     */
+    public function isFlipTransaction(): bool
+    {
+        return $this->payment_gateway === 'flip';
+    }
+
+    /**
+     * Check if this is a Midtrans transaction
+     */
+    public function isMidtransTransaction(): bool
+    {
+        return $this->payment_gateway === 'midtrans' || empty($this->payment_gateway);
+    }
+
+    /**
+     * Get the payment URL for Flip transactions
+     */
+    public function getFlipPaymentUrl(): ?string
+    {
+        if (!$this->isFlipTransaction()) {
+            return null;
+        }
+
+        return $this->payment_details['payment_url'] ?? $this->payment_details['bill_link'] ?? null;
     }
 }

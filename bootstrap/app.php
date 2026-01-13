@@ -25,6 +25,9 @@ return Application::configure(basePath: dirname(__DIR__))
     ->withMiddleware(function (Middleware $middleware) {
         $middleware->encryptCookies(except: ['appearance', 'sidebar_state']);
 
+        // Trust all proxies for ngrok/development (change in production!)
+        $middleware->trustProxies(at: '*');
+
         // Add CORS headers for ngrok
         $middleware->append(CorsMiddleware::class);
 
@@ -40,15 +43,19 @@ return Application::configure(basePath: dirname(__DIR__))
             'auth' => \App\Http\Middleware\EnsureAuthenticated::class,
             'guest' => \App\Http\Middleware\RedirectIfAuthenticated::class,
             'midtrans.webhook' => \App\Http\Middleware\VerifyMidtransWebhook::class,
+            'flip.webhook' => \App\Http\Middleware\VerifyFlipWebhook::class,
             'force.json' => \App\Http\Middleware\ForceJsonResponse::class,
             'anti.piracy' => \App\Http\Middleware\AntiPiracyMiddleware::class,
             'prevent.admin' => \App\Http\Middleware\PreventAdminAccess::class,
         ]);
         $middleware->redirectGuestsTo('/login');
 
-        // Exclude Midtrans webhook from CSRF verification
+        // Exclude payment webhooks from CSRF verification
         $middleware->validateCsrfTokens(except: [
             '/payments/midtrans/webhook',
+            '/payments/flip/webhook',
+            '/payments/flip/callback',
+            '/api/callback/flip'
         ]);
     })
     ->withExceptions(function (Exceptions $exceptions) {

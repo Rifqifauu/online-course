@@ -6,6 +6,8 @@ use App\Models\Course;
 use App\Models\Transaction;
 use App\Models\Enrollment;
 use App\Services\MidtransService;
+use App\Services\FlipService;
+use App\Services\PaymentGatewayManager;
 use App\Events\TransactionCompleted;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -17,24 +19,41 @@ use Illuminate\Http\RedirectResponse;
 
 class PaymentController extends Controller
 {
-    public function __construct(private readonly MidtransService $midtrans)
-    {
+    public function __construct(
+        private readonly MidtransService $midtrans,
+        private readonly FlipService $flip,
+        private readonly PaymentGatewayManager $gatewayManager
+    ) {
     }
 
+    /**
+     * Get current default gateway
+     */
+    private function getDefaultGateway(): string
+    {
+        return $this->gatewayManager->getDefaultGateway();
+    }
+
+    /**
+     * Create transaction for course purchase
+     */
     public function createCourseTransaction(Request $request, int $courseId): JsonResponse
     {
         $request->validate([
             'payment_method' => 'nullable|string',
+            'gateway' => 'nullable|string|in:midtrans,flip',
         ]);
 
         $course = Course::query()->where('status', 'published')->findOrFail($courseId);
         $user = $request->user();
+        $gateway = $request->input('gateway', $this->getDefaultGateway());
 
         Log::info('Payment transaction request', [
             'user_id' => $user->id,
             'course_id' => $courseId,
             'course_price' => $course->price,
             'is_pro' => $course->is_pro,
+            'gateway' => $gateway,
             'user_agent' => $request->userAgent(),
         ]);
 
@@ -85,62 +104,157 @@ class PaymentController extends Controller
         }
 
         try {
-            // Use improved MidtransService logic with real-time validation
-            $result = $this->midtrans->createCourseTransaction($user, $course, $request->string('payment_method')->toString());
-
-            // Check if transaction was expired and needs to be recreated
-            if (isset($result['error']) && isset($result['expired_transaction'])) {
-                Log::info('Previous transaction expired, user needs to create new one', [
-                    'user_id' => $user->id,
-                    'course_id' => $courseId,
-                    'expired_order_id' => $result['expired_transaction']->midtrans_order_id,
-                ]);
-
-                return response()->json([
-                    'message' => $result['error'],
-                    'transaction_expired' => true,
-                    'can_retry' => true,
-                ], 410); // 410 Gone - indicates resource expired
+            // Use the appropriate gateway
+            if ($gateway === 'flip') {
+                return $this->createFlipTransaction($user, $course);
             }
 
-            // Check for missing essential data
-            if (empty($result['order_id']) || empty($result['snap_token'])) {
-                throw new \Exception('Invalid response from Midtrans: missing order_id or snap_token');
-            }
-
-            Log::info('Transaction created/retrieved successfully', [
-                'user_id' => $user->id,
-                'course_id' => $courseId,
-                'order_id' => $result['order_id'],
-                'is_existing' => $result['is_existing'] ?? false,
-                'snap_token_present' => !empty($result['snap_token'])
-            ]);
-
-            return response()->json([
-                'order_id' => $result['order_id'],
-                'snap_token' => $result['snap_token'],
-                'redirect_url' => $result['redirect_url'],
-                'client_key' => (string) config('midtrans.client_key'),
-                'is_production' => (bool) config('midtrans.is_production'),
-                'enabled_pay_button' => (bool) config('midtrans.enable_pay_button'),
-                'existing_transaction' => $result['is_existing'] ?? false,
-            ]);
+            return $this->createMidtransTransaction($user, $course, $request->string('payment_method')->toString());
 
         } catch (\Exception $e) {
             Log::error('Failed to create transaction', [
                 'user_id' => $user->id,
                 'course_id' => $courseId,
+                'gateway' => $gateway,
                 'error' => $e->getMessage(),
                 'trace' => $e->getTraceAsString(),
             ]);
 
+            // Extract user-friendly error message
+            $errorMessage = $e->getMessage();
+
+            // Check for specific error types and provide user-friendly messages
+            if (str_contains($errorMessage, 'Flip API Error:')) {
+                $errorMessage = str_replace('Flip API Error: ', '', $errorMessage);
+            } elseif (str_contains($errorMessage, 'Autentikasi gagal')) {
+                $errorMessage = 'Konfigurasi pembayaran tidak valid. Hubungi administrator.';
+            } elseif (!config('app.debug')) {
+                // In production, don't expose internal error details
+                if (
+                    !str_starts_with($errorMessage, 'Gagal') &&
+                    !str_starts_with($errorMessage, 'Harga') &&
+                    !str_starts_with($errorMessage, 'Konfigurasi')
+                ) {
+                    $errorMessage = 'Gagal membuat transaksi. Silakan coba lagi.';
+                }
+            }
+
             return response()->json([
-                'message' => 'Gagal membuat transaksi. Silakan coba lagi.',
-                'error' => config('app.debug') ? $e->getMessage() : 'Internal server error',
+                'message' => $errorMessage,
+                'error' => config('app.debug') ? $e->getMessage() : null,
+                'gateway' => $gateway,
             ], 500);
         }
     }
 
+    /**
+     * Create Midtrans transaction
+     */
+    private function createMidtransTransaction($user, Course $course, ?string $paymentMethod): JsonResponse
+    {
+        $result = $this->midtrans->createCourseTransaction($user, $course, $paymentMethod);
+
+        // Check if transaction was expired and needs to be recreated
+        if (isset($result['error']) && isset($result['expired_transaction'])) {
+            Log::info('Previous transaction expired, user needs to create new one', [
+                'user_id' => $user->id,
+                'course_id' => $course->id,
+                'expired_order_id' => $result['expired_transaction']->midtrans_order_id,
+            ]);
+
+            return response()->json([
+                'message' => $result['error'],
+                'transaction_expired' => true,
+                'can_retry' => true,
+            ], 410);
+        }
+
+        // Check for missing essential data
+        if (empty($result['order_id']) || empty($result['snap_token'])) {
+            throw new \Exception('Invalid response from Midtrans: missing order_id or snap_token');
+        }
+
+        Log::info('Midtrans transaction created/retrieved successfully', [
+            'user_id' => $user->id,
+            'course_id' => $course->id,
+            'order_id' => $result['order_id'],
+            'is_existing' => $result['is_existing'] ?? false,
+            'snap_token_present' => !empty($result['snap_token'])
+        ]);
+
+        return response()->json([
+            'gateway' => 'midtrans',
+            'order_id' => $result['order_id'],
+            'snap_token' => $result['snap_token'],
+            'redirect_url' => $result['redirect_url'],
+            'client_key' => (string) config('midtrans.client_key'),
+            'is_production' => (bool) config('midtrans.is_production'),
+            'enabled_pay_button' => (bool) config('midtrans.enable_pay_button'),
+            'existing_transaction' => $result['is_existing'] ?? false,
+        ]);
+    }
+
+    /**
+     * Create Flip transaction
+     */
+    private function createFlipTransaction($user, Course $course): JsonResponse
+    {
+        $result = $this->flip->createCourseTransaction($user, $course);
+
+        // Check if transaction is already completed
+        if ($result['is_completed'] ?? false) {
+            Log::info('Flip transaction already completed', [
+                'user_id' => $user->id,
+                'course_id' => $course->id,
+                'bill_id' => $result['bill_id'],
+            ]);
+
+            // Trigger enrollment
+            if (isset($result['transaction'])) {
+                $this->autoEnrollUserToCourse($result['transaction']);
+            }
+
+            return response()->json([
+                'gateway' => 'flip',
+                'bill_id' => $result['bill_id'],
+                'payment_url' => null,
+                'transaction' => $result['transaction'],
+                'existing_transaction' => true,
+                'is_completed' => true,
+                'message' => 'Pembayaran sudah selesai.',
+            ]);
+        }
+
+        // Validate payment URL for non-completed transactions
+        if (empty($result['payment_url'])) {
+            Log::error('Flip response missing payment_url', [
+                'user_id' => $user->id,
+                'course_id' => $course->id,
+                'result' => $result,
+            ]);
+            throw new \Exception('Gagal mendapatkan URL pembayaran dari Flip. Silakan coba lagi.');
+        }
+
+        Log::info('Flip transaction created/retrieved successfully', [
+            'user_id' => $user->id,
+            'course_id' => $course->id,
+            'bill_id' => $result['bill_id'],
+            'is_existing' => $result['is_existing'] ?? false,
+            'payment_url' => $result['payment_url'],
+        ]);
+
+        return response()->json([
+            'gateway' => 'flip',
+            'bill_id' => $result['bill_id'],
+            'payment_url' => $result['payment_url'],
+            'transaction' => $result['transaction'],
+            'existing_transaction' => $result['is_existing'] ?? false,
+        ]);
+    }
+
+    /**
+     * Handle Midtrans webhook
+     */
     public function handleMidtransWebhook(Request $request): JsonResponse
     {
         $payload = $request->all();
@@ -162,7 +276,6 @@ class PaymentController extends Controller
         $midtransStatus = (string) ($payload['transaction_status'] ?? '');
         $fraudStatus = (string) ($payload['fraud_status'] ?? '');
 
-        // Konsisten gunakan mapping dari service (expire => expired)
         $newStatus = $this->midtrans->mapMidtransStatusToLocal($midtransStatus, $fraudStatus);
 
         Log::info('Updating transaction status', [
@@ -182,29 +295,208 @@ class PaymentController extends Controller
 
         // Fire event and trigger immediate auto-enrollment when payment is completed
         if ($newStatus === 'completed') {
-            Log::info('Payment completed via webhook, triggering auto-enrollment', [
-                'order_id' => $orderId,
-                'user_id' => $transaction->user_id,
-                'course_id' => $transaction->transactionable_id,
-            ]);
-
-            // Refresh transaction to get latest data
-            $transaction->refresh();
-
-            // Trigger immediate auto-enrollment - CRITICAL for webhook flow
-            $this->autoEnrollUserToCourse($transaction);
-
-            // Fire event for any additional listeners/jobs
-            TransactionCompleted::dispatch($transaction);
+            $this->handlePaymentCompleted($transaction, $orderId);
         }
 
         return response()->json(['message' => 'OK']);
     }
 
-    // Mapping status dipindahkan ke MidtransService::mapMidtransStatusToLocal
+    /**
+     * Handle Flip webhook
+     */
+    public function handleFlipWebhook(Request $request): JsonResponse
+    {
+        $payload = $request->input('flip_payload', $request->all());
+
+        Log::info('Flip webhook processing', [
+            'payload' => $payload,
+        ]);
+
+        $transaction = $this->flip->processWebhook($payload);
+
+        if (!$transaction) {
+            // If this is a test webhook from dashboard, return success
+            $billId = $payload['bill_link_id'] ?? $payload['id'] ?? 'unknown';
+
+            Log::info('Webhook received but no transaction found - possibly test webhook', [
+                'bill_id' => $billId,
+                'payload_keys' => array_keys($payload),
+            ]);
+
+            // Return 200 OK for test webhooks so Flip dashboard shows success
+            return response()->json([
+                'message' => 'Webhook received',
+                'status' => 'accepted',
+                'note' => 'No transaction found - this may be a test webhook',
+                'bill_id' => $billId,
+            ]);
+        }
+
+        // Fire event and trigger immediate auto-enrollment when payment is completed
+        if ($transaction->status === 'completed') {
+            $this->handlePaymentCompleted($transaction, $transaction->flip_bill_id);
+        }
+
+        Log::info('Webhook processed successfully', [
+            'transaction_id' => $transaction->id,
+            'status' => $transaction->status,
+        ]);
+
+        return response()->json([
+            'message' => 'OK',
+            'status' => 'processed',
+            'transaction_id' => $transaction->id,
+        ]);
+    }
 
     /**
-     * Show payment page with embedded Midtrans Snap
+     * Handle Flip payment callback (redirect from Flip after payment)
+     */
+    public function handleFlipCallback(Request $request): RedirectResponse
+    {
+        $billId = $request->query('bill_link_id') ?? $request->query('id');
+        $courseId = $request->query('course_id');
+        $user = $request->user();
+
+        Log::info('Flip callback received', [
+            'bill_id' => $billId,
+            'course_id' => $courseId,
+            'user_id' => $user?->id,
+            'all_query' => $request->query(),
+        ]);
+
+        $transaction = null;
+        $paymentCompleted = false;
+
+        if ($billId) {
+            // Find the transaction first
+            $transaction = Transaction::where('flip_bill_id', $billId)->first();
+
+            if (!$transaction) {
+                Log::warning('Flip callback - transaction not found', ['bill_id' => $billId]);
+            } else {
+                // Force check bill status from Flip API to get the latest status
+                // This will also check payments endpoint for INACTIVE bills
+                $statusInfo = $this->flip->getTransactionStatus($billId);
+
+                Log::info('Flip callback - bill status check', [
+                    'bill_id' => $billId,
+                    'status_info' => $statusInfo,
+                    'current_db_status' => $transaction->status,
+                ]);
+
+                // Refresh transaction after getTransactionStatus (it may have been updated)
+                $transaction->refresh();
+
+                // If status is completed from API or already in DB
+                if (($statusInfo && $statusInfo['status'] === 'completed') || $transaction->status === 'completed') {
+                    $paymentCompleted = true;
+
+                    // Update transaction details with payment method from bill status if not already completed
+                    if ($transaction->status !== 'completed') {
+                        $details = $transaction->payment_details ?? [];
+                        $details['callback_received_at'] = now()->toISOString();
+                        $details['flip_final_status'] = $statusInfo;
+
+                        $transaction->update([
+                            'status' => 'completed',
+                            'payment_details' => $details,
+                            'payment_method' => $statusInfo['payment_method'] ?? $transaction->payment_method,
+                        ]);
+
+                        Log::info('Flip callback - updated transaction to completed', [
+                            'transaction_id' => $transaction->id,
+                            'bill_id' => $billId,
+                        ]);
+                    }
+
+                    $this->handlePaymentCompleted($transaction, $billId);
+                }
+            }
+        }
+
+        // Determine redirect based on payment status
+        if ($user) {
+            // Get course ID from transaction if not in query
+            if (!$courseId && $transaction && $transaction->transactionable_type === Course::class) {
+                $courseId = $transaction->transactionable_id;
+            }
+
+            if ($courseId) {
+                // Check if user is enrolled
+                $isEnrolled = Enrollment::where('user_id', $user->id)
+                    ->where('course_id', $courseId)
+                    ->exists();
+
+                if ($isEnrolled) {
+                    Log::info('Flip callback - user enrolled, redirecting to learn page', [
+                        'user_id' => $user->id,
+                        'course_id' => $courseId,
+                    ]);
+
+                    return redirect()->route('courses.learn', $courseId)
+                        ->with('success', 'Pembayaran berhasil! Anda sudah terdaftar di kursus.');
+                }
+
+                // Payment completed but not enrolled yet - try to enroll again
+                if ($paymentCompleted && $transaction) {
+                    Log::info('Flip callback - payment completed but not enrolled, retrying enrollment', [
+                        'user_id' => $user->id,
+                        'course_id' => $courseId,
+                        'transaction_id' => $transaction->id,
+                    ]);
+
+                    $this->autoEnrollUserToCourse($transaction);
+
+                    // Check enrollment again
+                    $isEnrolled = Enrollment::where('user_id', $user->id)
+                        ->where('course_id', $courseId)
+                        ->exists();
+
+                    if ($isEnrolled) {
+                        return redirect()->route('courses.learn', $courseId)
+                            ->with('success', 'Pembayaran berhasil! Anda sudah terdaftar di kursus.');
+                    }
+                }
+
+                // Redirect to payment page to show status
+                return redirect()->route('payments.show', $courseId)
+                    ->with(
+                        $paymentCompleted ? 'success' : 'info',
+                        $paymentCompleted
+                        ? 'Pembayaran berhasil! Memproses pendaftaran kursus...'
+                        : 'Memproses pembayaran...'
+                    );
+            }
+        }
+
+        return redirect()->route('home');
+    }
+
+    /**
+     * Common handler for payment completion
+     */
+    private function handlePaymentCompleted(Transaction $transaction, string $orderId): void
+    {
+        Log::info('Payment completed, triggering auto-enrollment', [
+            'order_id' => $orderId,
+            'user_id' => $transaction->user_id,
+            'course_id' => $transaction->transactionable_id,
+            'gateway' => $transaction->payment_gateway,
+        ]);
+
+        // Refresh transaction to get latest data
+        $transaction->refresh();
+
+        // Trigger immediate auto-enrollment
+        $this->autoEnrollUserToCourse($transaction);
+
+        // Fire event for any additional listeners/jobs
+        TransactionCompleted::dispatch($transaction);
+    }
+
+    /**
+     * Show payment page with embedded Midtrans Snap or Flip redirect
      */
     public function showPaymentPage(Request $request, int $courseId): Response|RedirectResponse
     {
@@ -216,6 +508,7 @@ class PaymentController extends Controller
         $course->append('thumbnail');
 
         $user = $request->user();
+        $defaultGateway = $this->getDefaultGateway();
 
         // Check if course is free - redirect to show page
         if (!$course->is_pro || (int) $course->price <= 0) {
@@ -254,14 +547,36 @@ class PaymentController extends Controller
                 'course' => $course,
                 'transaction' => $completedTransaction,
                 'snapToken' => null,
+                'paymentUrl' => null,
                 'clientKey' => (string) config('midtrans.client_key'),
                 'isProduction' => (bool) config('midtrans.is_production'),
                 'isAlreadyPaid' => true,
                 'isAlreadyEnrolled' => false,
+                'defaultGateway' => $defaultGateway,
             ]);
         }
 
-        // Use improved MidtransService to get/create transaction
+        // Check for existing pending transaction
+        $pendingTransaction = Transaction::where('user_id', $user->id)
+            ->where('transactionable_id', $courseId)
+            ->where('transactionable_type', Course::class)
+            ->whereIn('status', ['pending', 'processing'])
+            ->orderBy('created_at', 'desc')
+            ->first();
+
+        // Handle based on gateway
+        if ($defaultGateway === 'flip') {
+            return $this->showFlipPaymentPage($request, $course, $user, $pendingTransaction);
+        }
+
+        return $this->showMidtransPaymentPage($request, $course, $user, $pendingTransaction);
+    }
+
+    /**
+     * Show Midtrans payment page
+     */
+    private function showMidtransPaymentPage(Request $request, Course $course, $user, ?Transaction $pendingTransaction): Response
+    {
         try {
             $result = $this->midtrans->createCourseTransaction($user, $course);
 
@@ -269,7 +584,7 @@ class PaymentController extends Controller
             if (isset($result['error']) && isset($result['expired_transaction'])) {
                 Log::info('Showing expired transaction page', [
                     'user_id' => $user->id,
-                    'course_id' => $courseId,
+                    'course_id' => $course->id,
                     'expired_order_id' => $result['expired_transaction']->midtrans_order_id,
                 ]);
 
@@ -277,11 +592,13 @@ class PaymentController extends Controller
                     'course' => $course,
                     'transaction' => null,
                     'snapToken' => null,
+                    'paymentUrl' => null,
                     'clientKey' => (string) config('midtrans.client_key'),
                     'isProduction' => (bool) config('midtrans.is_production'),
                     'isAlreadyEnrolled' => false,
                     'transactionExpired' => true,
                     'expiredMessage' => $result['error'],
+                    'defaultGateway' => 'midtrans',
                 ]);
             }
 
@@ -289,7 +606,7 @@ class PaymentController extends Controller
             if (!empty($result['order_id']) && !empty($result['snap_token'])) {
                 Log::info('Showing payment page with valid transaction', [
                     'user_id' => $user->id,
-                    'course_id' => $courseId,
+                    'course_id' => $course->id,
                     'order_id' => $result['order_id'],
                     'is_existing' => $result['is_existing'] ?? false,
                 ]);
@@ -298,20 +615,22 @@ class PaymentController extends Controller
                     'course' => $course,
                     'transaction' => $result['transaction'],
                     'snapToken' => $result['snap_token'],
+                    'paymentUrl' => null,
                     'clientKey' => (string) config('midtrans.client_key'),
                     'isProduction' => (bool) config('midtrans.is_production'),
                     'isAlreadyEnrolled' => false,
                     'transactionExpired' => false,
+                    'defaultGateway' => 'midtrans',
                 ]);
             }
 
-            // Fallback - something went wrong, show page without transaction
+            // Fallback - something went wrong
             throw new \Exception('No valid transaction could be created or found');
 
         } catch (\Exception $e) {
-            Log::error('Error in showPaymentPage', [
+            Log::error('Error in showMidtransPaymentPage', [
                 'user_id' => $user->id,
-                'course_id' => $courseId,
+                'course_id' => $course->id,
                 'error' => $e->getMessage()
             ]);
 
@@ -319,11 +638,95 @@ class PaymentController extends Controller
                 'course' => $course,
                 'transaction' => null,
                 'snapToken' => null,
+                'paymentUrl' => null,
                 'clientKey' => (string) config('midtrans.client_key'),
                 'isProduction' => (bool) config('midtrans.is_production'),
                 'isAlreadyEnrolled' => false,
                 'transactionExpired' => false,
                 'error' => 'Gagal memuat halaman pembayaran. Silakan coba lagi.',
+                'defaultGateway' => 'midtrans',
+            ]);
+        }
+    }
+
+    /**
+     * Show Flip payment page
+     */
+    private function showFlipPaymentPage(Request $request, Course $course, $user, ?Transaction $pendingTransaction): Response|RedirectResponse
+    {
+        try {
+            $result = $this->flip->createCourseTransaction($user, $course);
+
+            Log::info('Showing Flip payment page', [
+                'user_id' => $user->id,
+                'course_id' => $course->id,
+                'bill_id' => $result['bill_id'],
+                'is_existing' => $result['is_existing'] ?? false,
+                'is_completed' => $result['is_completed'] ?? false,
+            ]);
+
+            // Handle case when transaction is already completed
+            if ($result['is_completed'] ?? false) {
+                // Trigger auto-enrollment
+                $this->autoEnrollUserToCourse($result['transaction']);
+
+                // Check if user is now enrolled
+                $isEnrolled = Enrollment::where('user_id', $user->id)
+                    ->where('course_id', $course->id)
+                    ->exists();
+
+                if ($isEnrolled) {
+                    return redirect()->route('courses.learn', $course->id)
+                        ->with('success', 'Pembayaran sudah selesai! Anda sudah terdaftar di kursus.');
+                }
+
+                // Payment completed but enrollment might still be processing
+                return Inertia::render('payment/index', [
+                    'course' => $course,
+                    'transaction' => $result['transaction'],
+                    'snapToken' => null,
+                    'paymentUrl' => null,
+                    'billId' => $result['bill_id'],
+                    'clientKey' => null,
+                    'isProduction' => (bool) config('flip.is_production'),
+                    'isAlreadyEnrolled' => false,
+                    'isAlreadyPaid' => true,
+                    'transactionExpired' => false,
+                    'defaultGateway' => 'flip',
+                ]);
+            }
+
+            return Inertia::render('payment/index', [
+                'course' => $course,
+                'transaction' => $result['transaction'],
+                'snapToken' => null,
+                'paymentUrl' => $result['payment_url'],
+                'billId' => $result['bill_id'],
+                'clientKey' => null,
+                'isProduction' => (bool) config('flip.is_production'),
+                'isAlreadyEnrolled' => false,
+                'transactionExpired' => false,
+                'defaultGateway' => 'flip',
+            ]);
+
+        } catch (\Exception $e) {
+            Log::error('Error in showFlipPaymentPage', [
+                'user_id' => $user->id,
+                'course_id' => $course->id,
+                'error' => $e->getMessage()
+            ]);
+
+            return Inertia::render('payment/index', [
+                'course' => $course,
+                'transaction' => null,
+                'snapToken' => null,
+                'paymentUrl' => null,
+                'clientKey' => null,
+                'isProduction' => (bool) config('flip.is_production'),
+                'isAlreadyEnrolled' => false,
+                'transactionExpired' => false,
+                'error' => 'Gagal memuat halaman pembayaran. Silakan coba lagi.',
+                'defaultGateway' => 'flip',
             ]);
         }
     }
@@ -356,11 +759,18 @@ class PaymentController extends Controller
             ->orderBy('created_at', 'desc')
             ->get()
             ->map(function ($transaction) {
-                // Check and update transaction status from Midtrans for pending transactions
+                // Check and update transaction status based on gateway
                 if (in_array($transaction->status, ['pending', 'processing'])) {
-                    $statusInfo = $this->midtrans->getTransactionStatus($transaction->midtrans_order_id);
-                    if ($statusInfo) {
-                        $transaction->status = $statusInfo['status'];
+                    if ($transaction->payment_gateway === 'flip' && $transaction->flip_bill_id) {
+                        $statusInfo = $this->flip->getTransactionStatus($transaction->flip_bill_id);
+                        if ($statusInfo) {
+                            $transaction->status = $statusInfo['status'];
+                        }
+                    } elseif ($transaction->midtrans_order_id) {
+                        $statusInfo = $this->midtrans->getTransactionStatus($transaction->midtrans_order_id);
+                        if ($statusInfo) {
+                            $transaction->status = $statusInfo['status'];
+                        }
                     }
                 }
 
@@ -386,8 +796,12 @@ class PaymentController extends Controller
     {
         $user = $request->user();
 
+        // Try to find by midtrans_order_id first, then by flip_bill_id
         $transaction = Transaction::with(['transactionable'])
-            ->where('midtrans_order_id', $orderId)
+            ->where(function ($query) use ($orderId) {
+                $query->where('midtrans_order_id', $orderId)
+                    ->orWhere('flip_bill_id', $orderId);
+            })
             ->where('user_id', $user->id)
             ->firstOrFail();
 
@@ -409,7 +823,11 @@ class PaymentController extends Controller
     {
         $user = $request->user();
 
-        $transaction = Transaction::where('midtrans_order_id', $orderId)
+        // Try to find by midtrans_order_id first, then by flip_bill_id
+        $transaction = Transaction::where(function ($query) use ($orderId) {
+            $query->where('midtrans_order_id', $orderId)
+                ->orWhere('flip_bill_id', $orderId);
+        })
             ->where('user_id', $user->id)
             ->firstOrFail();
 
@@ -420,13 +838,18 @@ class PaymentController extends Controller
             ], 422);
         }
 
-        // Try to cancel in Midtrans first
+        // Try to cancel in payment gateway first
         try {
-            $this->midtrans->cancelTransaction($orderId);
+            if ($transaction->payment_gateway === 'flip' && $transaction->flip_bill_id) {
+                $this->flip->cancelBill($transaction->flip_bill_id);
+            } elseif ($transaction->midtrans_order_id) {
+                $this->midtrans->cancelTransaction($transaction->midtrans_order_id);
+            }
         } catch (\Exception $e) {
             // Log but don't fail the request
-            Log::warning('Failed to cancel transaction in Midtrans', [
+            Log::warning('Failed to cancel transaction in payment gateway', [
                 'order_id' => $orderId,
+                'gateway' => $transaction->payment_gateway,
                 'error' => $e->getMessage()
             ]);
         }
@@ -441,38 +864,61 @@ class PaymentController extends Controller
     }
 
     /**
-     * Check transaction status from Midtrans
+     * Check transaction status from payment gateway
      */
     public function checkTransactionStatus(Request $request, string $orderId): JsonResponse
     {
         $user = $request->user();
 
-        $transaction = Transaction::where('midtrans_order_id', $orderId)
+        // Try to find by midtrans_order_id first, then by flip_bill_id
+        $transaction = Transaction::where(function ($query) use ($orderId) {
+            $query->where('midtrans_order_id', $orderId)
+                ->orWhere('flip_bill_id', $orderId);
+        })
             ->where('user_id', $user->id)
             ->firstOrFail();
 
-        // Get status from Midtrans
-        $statusInfo = $this->midtrans->getTransactionStatus($orderId);
+        // If transaction is already completed or cancelled, return database status (don't check API)
+        if (in_array($transaction->status, ['completed', 'cancelled', 'refunded'])) {
+            return response()->json([
+                'order_id' => $orderId,
+                'status' => $transaction->status,
+                'gateway' => $transaction->payment_gateway,
+                'is_expired' => false,
+                'from_database' => true,
+            ]);
+        }
+
+        // Get status from payment gateway for pending/processing/expired transactions
+        $statusInfo = null;
+        if ($transaction->payment_gateway === 'flip' && $transaction->flip_bill_id) {
+            $statusInfo = $this->flip->getTransactionStatus($transaction->flip_bill_id);
+        } elseif ($transaction->midtrans_order_id) {
+            $statusInfo = $this->midtrans->getTransactionStatus($transaction->midtrans_order_id);
+        }
 
         if (!$statusInfo) {
+            // If API fails, return current database status
             return response()->json([
-                'message' => 'Tidak dapat mengecek status transaksi',
+                'order_id' => $orderId,
                 'status' => $transaction->status,
-            ], 500);
+                'gateway' => $transaction->payment_gateway,
+                'is_expired' => $transaction->status === 'expired',
+                'from_database' => true,
+            ]);
         }
 
         return response()->json([
             'order_id' => $orderId,
             'status' => $statusInfo['status'],
-            'midtrans_status' => $statusInfo['midtrans_status'],
-            'payment_type' => $statusInfo['payment_type'],
-            'transaction_time' => $statusInfo['transaction_time'],
-            'is_expired' => in_array($statusInfo['status'], ['expired', 'cancelled', 'failed']),
+            'gateway' => $transaction->payment_gateway,
+            'is_expired' => $statusInfo['is_expired'] ?? false,
+            'from_api' => true,
         ]);
     }
 
     /**
-     * Refresh snap token for existing transaction
+     * Refresh snap token for existing transaction (Midtrans only)
      */
     public function refreshSnapToken(Request $request, string $orderId): JsonResponse
     {
@@ -489,6 +935,13 @@ class PaymentController extends Controller
             ], 404);
         }
 
+        // Only works for Midtrans transactions
+        if ($transaction->payment_gateway === 'flip') {
+            return response()->json([
+                'message' => 'Fitur ini hanya tersedia untuk transaksi Midtrans.',
+            ], 422);
+        }
+
         // Check if transaction is for a course
         if ($transaction->transactionable_type !== Course::class) {
             return response()->json([
@@ -497,11 +950,6 @@ class PaymentController extends Controller
         }
 
         $course = $transaction->transactionable;
-
-        // Reuse logic: jika masih pending & punya snap_token -> return existing
-        // Jika pending tapi tidak ada snap_token -> minta user batalkan manual
-        // Jika status final (expired/cancelled/failed) -> buat baru
-        // Jika completed -> tidak boleh refresh
 
         if (in_array($transaction->status, ['completed'])) {
             return response()->json([
@@ -552,7 +1000,7 @@ class PaymentController extends Controller
     }
 
     /**
-     * Verify payment status with Midtrans and trigger enrollment
+     * Verify payment status and trigger enrollment
      * This endpoint is called from frontend after payment success
      */
     public function verifyPaymentAndEnroll(Request $request, string $orderId): JsonResponse
@@ -564,8 +1012,11 @@ class PaymentController extends Controller
             'user_id' => $user->id,
         ]);
 
-        // Find transaction
-        $transaction = Transaction::where('midtrans_order_id', $orderId)
+        // Find transaction by either midtrans_order_id or flip_bill_id
+        $transaction = Transaction::where(function ($query) use ($orderId) {
+            $query->where('midtrans_order_id', $orderId)
+                ->orWhere('flip_bill_id', $orderId);
+        })
             ->where('user_id', $user->id)
             ->first();
 
@@ -577,17 +1028,23 @@ class PaymentController extends Controller
             ], 404);
         }
 
-        // Get real-time status from Midtrans
+        // Get real-time status from payment gateway
         try {
-            $statusInfo = $this->midtrans->getTransactionStatus($orderId);
+            $statusInfo = null;
+            if ($transaction->payment_gateway === 'flip' && $transaction->flip_bill_id) {
+                $statusInfo = $this->flip->getTransactionStatus($transaction->flip_bill_id);
+            } elseif ($transaction->midtrans_order_id) {
+                $statusInfo = $this->midtrans->getTransactionStatus($transaction->midtrans_order_id);
+            }
 
             if ($statusInfo) {
                 $newStatus = $statusInfo['status'];
 
                 // Update transaction status if changed
                 if ($transaction->status !== $newStatus) {
-                    Log::info('Updating transaction status from Midtrans API', [
+                    Log::info('Updating transaction status from gateway API', [
                         'order_id' => $orderId,
+                        'gateway' => $transaction->payment_gateway,
                         'old_status' => $transaction->status,
                         'new_status' => $newStatus,
                     ]);
@@ -595,7 +1052,7 @@ class PaymentController extends Controller
                     $details = $transaction->payment_details ?? [];
                     $details['frontend_verification'] = [
                         'verified_at' => now()->toISOString(),
-                        'midtrans_response' => $statusInfo,
+                        'gateway_response' => $statusInfo,
                     ];
 
                     $transaction->update([
@@ -605,8 +1062,9 @@ class PaymentController extends Controller
                 }
             }
         } catch (\Exception $e) {
-            Log::error('Failed to verify status with Midtrans', [
+            Log::error('Failed to verify status with payment gateway', [
                 'order_id' => $orderId,
+                'gateway' => $transaction->payment_gateway,
                 'error' => $e->getMessage(),
             ]);
         }
@@ -685,7 +1143,7 @@ class PaymentController extends Controller
             if (!$user) {
                 Log::warning('User not found for transaction', [
                     'transaction_id' => $transaction->id,
-                    'order_id' => $transaction->midtrans_order_id
+                    'order_id' => $transaction->midtrans_order_id ?? $transaction->flip_bill_id
                 ]);
                 return;
             }
@@ -719,14 +1177,16 @@ class PaymentController extends Controller
                     'user_id' => $user->id,
                     'course_id' => $courseId,
                     'transaction_id' => $transaction->id,
-                    'order_id' => $transaction->midtrans_order_id
+                    'order_id' => $transaction->midtrans_order_id ?? $transaction->flip_bill_id,
+                    'gateway' => $transaction->payment_gateway
                 ]);
             });
 
         } catch (\Exception $e) {
             Log::error('Failed to auto-enroll user after payment', [
                 'transaction_id' => $transaction->id,
-                'order_id' => $transaction->midtrans_order_id,
+                'order_id' => $transaction->midtrans_order_id ?? $transaction->flip_bill_id,
+                'gateway' => $transaction->payment_gateway,
                 'error' => $e->getMessage(),
                 'trace' => $e->getTraceAsString()
             ]);
